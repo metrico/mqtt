@@ -967,8 +967,8 @@ func (c *Client) handshake(conn net.Conn, requestPacket []byte) (*bufio.Reader, 
 // error puts the Client in an ErrDown state. Invocation should apply a backoff
 // once down. Retries on IsConnectionRefused, if any, should probably apply a
 // rather large backoff. See the Client example for a complete setup.
-func (c *Client) ReadSlices() (message, topic []byte, err error) {
-	message, topic, err = c.readSlices()
+func (c *Client) ReadSlices() (message, topic []byte, ack func(), err error) {
+	message, topic, ack, err = c.readSlices()
 	switch {
 	case err == c.bigMessage: // either nil or BigMessage
 		break
@@ -978,21 +978,22 @@ func (c *Client) ReadSlices() (message, topic []byte, err error) {
 	return
 }
 
-func (c *Client) readSlices() (message, topic []byte, err error) {
+func (c *Client) readSlices() (message, topic []byte, ack func(), err error) {
 	// A pending BigMessage implies that the connection was functional on
 	// the last return.
+	ack = nil
 	switch {
 	case c.bigMessage != nil:
 		<-c.Online() // extra verification
 		_, err = c.r.Discard(c.bigMessage.Size)
 		if err != nil {
 			c.toOffline()
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 
 	case c.readConn == nil:
 		if err := c.connect(); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		<-c.Online() // extra verification
 
@@ -1013,12 +1014,12 @@ func (c *Client) readSlices() (message, topic []byte, err error) {
 			key := uint(binary.BigEndian.Uint16(c.pendingAck[2:4])) | remoteIDKeyFlag
 			err = c.persistence.Save(key, net.Buffers{c.pendingAck})
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		}
 		err := c.write(nil, c.pendingAck)
 		if err != nil {
-			return nil, nil, err // keeps pendingAck to retry
+			return nil, nil, nil, err // keeps pendingAck to retry
 		}
 		c.pendingAck = c.pendingAck[:0]
 	}
@@ -1035,21 +1036,22 @@ func (c *Client) readSlices() (message, topic []byte, err error) {
 			c.toOffline()
 			if err := c.connect(); err != nil {
 				c.readConn = nil
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 
 			continue // with new connection
 
 		case errors.As(err, &c.bigMessage):
 			if head>>4 == typePUBLISH {
-				message, topic, err = c.onPUBLISH(head)
+				message, topic, ack, err = c.onPUBLISH(head)
+				ack()
 				// TODO(pascaldekloe): errDupe
 				if err != nil {
 					// If the packet is malformed then
 					// BigMessage is not the issue anymore.
 					c.bigMessage = nil
 					c.toOffline()
-					return nil, nil, err
+					return nil, nil, nil, err
 				}
 				c.bigMessage.Topic = string(topic) // copy
 				done := readBufSize - len(message)
@@ -1057,11 +1059,11 @@ func (c *Client) readSlices() (message, topic []byte, err error) {
 				c.r.Discard(done) // no errors guaranteed
 			}
 			c.peek = nil
-			return nil, nil, c.bigMessage
+			return nil, nil, nil, c.bigMessage
 
 		default:
 			c.toOffline()
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 
 		switch head >> 4 {
@@ -1072,9 +1074,9 @@ func (c *Client) readSlices() (message, topic []byte, err error) {
 		case typeCONNACK:
 			err = errCONNACKTwo
 		case typePUBLISH:
-			message, topic, err = c.onPUBLISH(head)
+			message, topic, ack, err = c.onPUBLISH(head)
 			if err == nil {
-				return message, topic, nil
+				return message, topic, ack, nil
 			}
 			if err == errDupe {
 				err = nil // just skip
@@ -1106,7 +1108,7 @@ func (c *Client) readSlices() (message, topic []byte, err error) {
 		}
 		if err != nil {
 			c.toOffline()
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 
 		// no errors guaranteed
@@ -1149,13 +1151,13 @@ func (e *BigMessage) ReadAll() ([]byte, error) {
 var errDupe = errors.New("mqtt: duplicate reception")
 
 // OnPUBLISH slices an inbound message from Client.peek.
-func (c *Client) onPUBLISH(head byte) (message, topic []byte, err error) {
+func (c *Client) onPUBLISH(head byte) (message, topic []byte, ack func(), err error) {
 	if len(c.peek) < 2 {
-		return nil, nil, fmt.Errorf("%w: PUBLISH with %d byte remaining length", errProtoReset, len(c.peek))
+		return nil, nil, nil, fmt.Errorf("%w: PUBLISH with %d byte remaining length", errProtoReset, len(c.peek))
 	}
 	i := int(uint(binary.BigEndian.Uint16(c.peek))) + 2
 	if i > len(c.peek) {
-		return nil, nil, fmt.Errorf("%w: PUBLISH topic exceeds remaining length", errProtoReset)
+		return nil, nil, nil, fmt.Errorf("%w: PUBLISH topic exceeds remaining length", errProtoReset)
 	}
 	topic = c.peek[2:i]
 
@@ -1165,43 +1167,47 @@ func (c *Client) onPUBLISH(head byte) (message, topic []byte, err error) {
 
 	case atLeastOnceLevel << 1:
 		if len(c.peek) < i+2 {
-			return nil, nil, fmt.Errorf("%w: PUBLISH packet identifier exceeds remaining length", errProtoReset)
+			return nil, nil, nil, fmt.Errorf("%w: PUBLISH packet identifier exceeds remaining length", errProtoReset)
 		}
 		packetID := binary.BigEndian.Uint16(c.peek[i:])
 		if packetID == 0 {
-			return nil, nil, errPacketIDZero
+			return nil, nil, nil, errPacketIDZero
 		}
 		i += 2
 
 		// enqueue for next call
-		c.pendingAck = append(c.pendingAck, typePUBACK<<4, 2, byte(packetID>>8), byte(packetID))
+		ack = func() {
+			c.pendingAck = append(c.pendingAck, typePUBACK<<4, 2, byte(packetID>>8), byte(packetID))
+		}
 
 	case exactlyOnceLevel << 1:
 		if len(c.peek) < i+2 {
-			return nil, nil, fmt.Errorf("%w: PUBLISH packet identifier exceeds remaining length", errProtoReset)
+			return nil, nil, nil, fmt.Errorf("%w: PUBLISH packet identifier exceeds remaining length", errProtoReset)
 		}
 		packetID := uint(binary.BigEndian.Uint16(c.peek[i:]))
 		if packetID == 0 {
-			return nil, nil, errPacketIDZero
+			return nil, nil, nil, errPacketIDZero
 		}
 		i += 2
 
 		bytes, err := c.persistence.Load(packetID | remoteIDKeyFlag)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if bytes != nil {
-			return nil, nil, errDupe
+			return nil, nil, nil, errDupe
 		}
 
 		// enqueue for next call
-		c.pendingAck = append(c.pendingAck, typePUBREC<<4, 2, byte(packetID>>8), byte(packetID))
+		ack = func() {
+			c.pendingAck = append(c.pendingAck, typePUBREC<<4, 2, byte(packetID>>8), byte(packetID))
+		}
 
 	default:
-		return nil, nil, fmt.Errorf("%w: PUBLISH with reserved quality-of-service level 3", errProtoReset)
+		return nil, nil, nil, fmt.Errorf("%w: PUBLISH with reserved quality-of-service level 3", errProtoReset)
 	}
 
-	return c.peek[i:], topic, nil
+	return c.peek[i:], topic, ack, nil
 }
 
 // OnPUBREL applies the second round-trip for “exactly-once” reception.
